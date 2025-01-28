@@ -1,0 +1,1546 @@
+---
+title: "Investigating post-pandemic global and country-level routine immunisation coverage trends"
+author: "Beth Evans"
+date: "16 January 2025"
+output: 
+  html_document:
+    code_folding: "show"
+    toc: TRUE
+    toc_depth: 4
+    toc_float: TRUE
+    toc_collapse: FALSE
+    number_sections: TRUE
+    highlight: pygments
+    theme: spacelab
+params:
+  data: "dtp3" # Defines which vaccine to run (DTP1 or DTP3)
+  test_year: "2023"   # Defines which year to run for single year analyses (2020-2023) 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      dev = c("png", "pdf"),
+                      fig.path = "figs/",
+                      dpi = 100)
+```
+
+# GENERAL SET-UP
+
+## Load packages
+
+```{r, message = FALSE, include = FALSE}
+library(epiDisplay)
+library(tidyverse)
+library(rio)
+library(magrittr)
+library(timetk)
+library(broom)
+library(scales)
+library(ggforce)
+library(urca)
+library(tseries)
+library(forecast)
+library(data.table)
+library(countrycode)
+library(here)
+library(flextable)
+library(webshot)
+library(wesanderson)
+library(cowplot)
+library(formattable)
+library(spData)
+library(rnaturalearth)
+library(officer)
+library(weights)
+library(randomForest)
+library(corrplot)
+library(MASS)
+library(pROC)
+library(caret)
+library(adegenet)
+
+select <- dplyr::select
+```
+
+## Load raw data for descriptive analyses
+Import data:
+
+- Coverage data from WUENIC for 2000-2022
+- Income group classification from World Bank
+- Key demographic data from United Nations World Population Prospects (UN WPP)
+
+```{r}
+# Set-up toggle to pull DTP1, DTP3, and MCV1 data respectively when compiling for the appropriate antigen
+if (params$data == "dtp1") {
+  file_path <- here::here("data", "wuenic2023_dtp1.csv")
+} else if (params$data == "dtp3") {
+  file_path <- here::here("data", "wuenic2023_dtp3.csv")
+} else if (params$data == "mcv1") {
+  file_path <- here::here("data", "wuenic2023_mcv1.csv") 
+} else {
+  msg <- sprintf("Unknown dataset requested: %s", params$data)
+  stop(msg)
+}
+
+# Import WUENIC data
+data_raw <- file_path %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+data_raw
+
+# Import World Bank classification data
+file_path_wb <- here::here("data", "wb_ig_2023.csv")
+income <- file_path_wb %>%
+  rio::import(header = TRUE, skip = 5) %>%
+  tibble()
+income <- income[-c(1:5), ]
+income
+
+# Import UN WPP data - two files are needed, one for historic values (up to 2021), and one for projections (2022)
+file_path_unwpp_raw <- here::here("data", "WPP2024_GEN_F01_DEMOGRAPHIC_INDICATORS_COMPACT.csv")
+
+unwpp_raw <- file_path_unwpp_raw %>%
+  rio::import(header = TRUE, skip = 17) %>%
+  tibble()
+unwpp_raw
+```
+
+## Set-up output folders
+Outputs are stored in two separate folders (in addition to the compiled report,
+handled by the *reportfactory*), *figures/* and *csv/*. We make
+sure these exist.
+
+```{r}
+# Make sure output folder exists
+fig_folder <- here::here("figures_cov", params$data)
+if (!dir.exists(fig_folder)) {
+  dir.create(fig_folder, recursive = TRUE)
+}
+
+# Make sure output folder exists
+csv_folder <- here::here("csv_cov", params$data)
+if (!dir.exists(csv_folder)) {
+  dir.create(csv_folder, recursive = TRUE)
+}
+
+```
+
+
+# DESCRIPTIVE ANALYSES DATA PREPARATION
+Here we prepare the dataset analysed called `x`.
+
+## Data cleaning
+
+### Coverage data
+Steps taken for coverage data:
+
+- rename variables 
+- reshape data to long vs. wide format
+- add categorisation columns (income group, region)
+- select relevant columns only 
+
+```{r}
+# Clean and reshape coverage data
+data_clean <- data_raw %>% 
+  rename(iso_code = iso3) %>%
+  mutate(region = countrycode(iso_code,
+                              origin = "iso3c",
+                              destination = "un.region.name")) %>%
+  select(region, unicef_region, everything())
+
+data_long <- data_clean %>%
+  pivot_longer(-(region:vaccine), names_to = "year", values_to = "coverage")
+
+names(data_long) <- tolower(names(data_long))
+    
+data_long %<>% 
+  mutate(coverage = coverage / 100,
+         year = as.integer(year))
+data_long
+```
+
+### Income classification
+Steps taken for income data:
+
+- Extract income group as of 'Financial Year 2024' which refers to 2023
+  classification
+- Note that we used a fixed income group, i.e., not factoring in changes in
+  2020-2022.
+
+```{r}
+# Extract relvant data from income dataset
+income %<>% 
+  select(V1, `2023`) %>%
+  rename(iso_code = V1, `income_group` = `2023`) %>%
+  mutate(
+    income_group = recode_factor(income_group,
+                               "L" = "LIC",
+                               "LM" = "LMIC",
+                               "UM" = "UMIC",
+                               "H" = "HIC"))
+
+# Join 'income' classification to main dataset
+data_long %<>%
+  inner_join(income, by = "iso_code")
+data_long
+
+```
+
+### Population data
+Steps taken for population data:
+- Select relevant columns country and surviving infant estimate for each year,
+  from 2000 to 2023
+- Convert surviving infants estimates to numbers, and multiply them by 1000,
+   since recorded in thousands in original dataset
+
+```{r}
+# Clean population data
+unwpp_all <- unwpp_raw %>% 
+  filter(Type == "Country/Area") %>%
+  select(country = "Region, subregion, country or area *",
+         iso_code = "ISO3 Alpha-code",
+         population = "Total Population, as of 1 July (thousands)",
+         surviving_infants = "Live Births Surviving to Age 1 (thousands)",
+         year = "Year") %>%
+  mutate(year = as.numeric(year)) %>%
+  filter(year >= 2000,
+         year <= 2023) %>%
+  mutate(surviving_infants = as.numeric(gsub(",", "", surviving_infants)) * 1000,
+         population = as.numeric(gsub(" ", "", population)) * 1000) %>%
+  select(-country)
+
+## Create wide dataset for total population only
+unwpp_wide_all_pop <- unwpp_all %>%
+  select(-surviving_infants) %>%
+  pivot_wider(names_from = "year", names_prefix = "total_pop_", values_from = "population")
+unwpp_wide_all_pop
+
+```
+
+### Consolidate and clean combined dataset
+- Add in surviving infants data to the long dataset with coverage
+- Calculate the number of reached (vaxxed) and unimmunised (missed) children per year based on coverage * target population size
+```{r}
+data_long %<>%
+  left_join(unwpp_all, by = c("iso_code", "year")) %>%
+  mutate(vaxxed = round(surviving_infants * coverage,0),
+         missed = round(surviving_infants * (1-coverage),0)) 
+```
+
+
+Then we:
+- reorder the variables we are interested in
+- remove years prior to 2000
+- remove entries where coverage is NA
+- remove countries without data for the last 23 consecutive years (from 2000 to
+  2023, inclusive)
+```{r}
+# Reorder dataset
+x <- data_long %>%
+  select(region, country, iso_code, income_group, year, coverage, vaxxed) %>%
+  arrange(country, year)
+
+# Filter for data from 2000 onwards (inclusive), remove NAs
+x <- x %>%
+  filter(year >= 2000, !is.na(coverage))
+
+# Filter for countries with complete data from 2000 to 2023, i.e. 24 data points
+complete_countries <- x %>%
+  count(iso_code) %>%
+  filter(n == 24) %>%
+  pull(iso_code)
+
+x %<>%
+  filter(iso_code %in% complete_countries)
+
+```
+
+Finally we reshape as timeseries since `auto.arima` requires time series (`ts`) objects, which is essentially a wide
+format for coverage data (rows = years, columns = countries).
+```{r}
+ts_df <- x %>%
+  arrange(iso_code) %>%
+  filter(year < 2020) %>% 
+  select(year, iso_code, coverage) %>%
+  pivot_wider(values_from = coverage, names_from = iso_code) %>%
+  arrange(year) %>%
+  select(-year) %>% 
+  ts(start = 2000, freq = 1)
+
+```
+
+# ARIMA MODELLING
+Here we apply ARIMA to each country using the years 2000-2019 as training set,
+and derive a forecast for 2020 and 2021 with associated confidence intervals. The final
+object will be called `res`, and will include these forecasts, the actual values
+reported, and the corresponding coverage *deltas*, defined as (% reported - %
+expected).
+
+## Model parameters
+Model "expected' 2020, 2021, 2022, and 2023 coverage based, in the absence of COVID, based on
+2000-2019 trends.  ARIMA model uses timeseries data by country to (a) select the
+most appropriate model, defined by three parameters (p, d, q) selected as
+follows:
+
+- p = number of autoregressive terms - based on minimisation of the AIC
+- d = number of non-seasonal differences needed for stationarity - based on conducting KPSS tests
+- q = number of lagged forecast errors in the prediction equation - based on minimisation of the AIC
+
+and (b) predict 2020-2023 coverage based on this selected model.
+
+## Fitting models: Forecast 2020-2023 coverage based on 2000-2019 trends
+Note that in each WUENIC release, there may be 'retrospective' updates to coverage estimated and published in prior year datasets. For this reason we re-do analysis rather than leverage outputs from previously published papers (Evans & Jombart, 2022; and Evans et al., 2023).
+
+```{r} 
+#Forecast for 2020, 2021 and 2022 based on 2000-2019 inclusive
+ts_forecasts <- lapply(ts_df, # iterate over all countries
+                      function(y)
+                        forecast(auto.arima(y, seasonal = FALSE),
+                                 h = 4,     # forecast 2020-2023 inclusive
+                                 level = 95 # 95% CIs
+                                 ))
+
+# extract forecasts and format output
+forecasts <- lapply(ts_forecasts,
+               function(e) c(method = e$method, as.data.frame(e))) %>%
+  lapply(function(e) tibble(data.frame(e),year = c(2020,2021,2022,2023))) %>% 
+  bind_rows(.id = "iso_code") %>%
+  mutate(mean = `Point.Forecast`,
+         lower_ci = `Lo.95`,
+         upper_ci = `Hi.95`) %>%
+  tibble() %>%
+  select(iso_code, method, year, mean, lower_ci, upper_ci) %>%
+  mutate(mean = if_else(mean > 0.99, 0.99, mean),          # Cap at 99% coverage as per WUENIC rules
+         lower_ci = if_else(lower_ci < 0, 0, lower_ci),
+         upper_ci = if_else(upper_ci > 0.99, 0.99, upper_ci),)
+forecasts
+
+```
+
+## Create output 'forecasted' dataset
+Here we:
+- combine the reported WUENIC data for 2020-2023 with the ARIMA forecast coverage for 2020-2022
+- calculate a variable called 'delta' which is the difference between reported and expected coverage (and the associated confidence intervals)
+
+'res_all' is the dataset for all countries for 2020-2023 actual and estimated coverage
+```{r}
+x_temp <- x %>%
+  filter(year == 2020 | year == 2021 | year == 2022 | year == 2023) %>%
+  arrange(iso_code) 
+
+res_all <- forecasts %>%
+  left_join(x_temp, by = c("iso_code", "year")) %>%
+  mutate(delta = coverage - mean,
+         lower_delta = coverage - lower_ci,
+         upper_delta = coverage - upper_ci,
+         within_ci = (coverage >= lower_ci) & (coverage <= upper_ci),
+         ci_width = upper_ci - lower_ci) %>%
+  left_join(unwpp_all, by = c("iso_code", "year")) %>%
+  mutate(expected_num = round(mean*surviving_infants,0),
+           delta_num = vaxxed-expected_num)
+```
+
+## Create time series dataset that includes 2019 actuals and 2020-2022 expected and actuals for summary analyses
+```{r}
+# Extract forecasted coverage from results dataset
+temp_forecast_data <- res_all %>%
+  select(iso_code, year, forecast_coverage = mean)
+
+# Create temporary dataset with the 2019 actuals coverage
+temp_cov_2019 <- x %>%
+  filter(iso_code %in% temp_forecast_data$iso_code,
+         year == 2019) %>%
+  select(iso_code, coverage_2019 = coverage)
+
+# Create combined dataset including actuals and forecasted data; and include population data to translate coverage to number of immunisations
+timeseries_dat <- x %>%
+  filter(iso_code %in% temp_forecast_data$iso_code) %>% 
+  left_join(temp_forecast_data, by = c("year", "iso_code")) %>%
+  left_join(temp_cov_2019, by = "iso_code") %>%
+  mutate(gap_2019_to_forecast = ifelse(!is.na(forecast_coverage), 
+                                       forecast_coverage - coverage_2019, "")) %>%
+  select(-c(coverage_2019)) %>%
+  left_join(unwpp_all, by = c("iso_code","year")) %>%
+  mutate(reached_kids = round(coverage * surviving_infants,0),
+         expected_kids = case_when(is.na(forecast_coverage) ~ round(reached_kids,0),
+                                   .default = round(forecast_coverage * surviving_infants,0)),
+         extra_missed = expected_kids - reached_kids)
+
+```
+
+## Set-up output figure set-ups for analyses
+- Set-up shortcuts for colour schemes for income group and regional analyses
+```{r}
+# Colour scheme for regions
+n_regions <- res_all %>%
+  pull(region) %>%
+  unique() %>%
+  length()
+region_pal <- wes_palette("Darjeeling1", n_regions, type = "discrete")
+
+# Colour scheme for income groups
+n_income <- res_all %>%
+  filter(income_group != "") %>%
+  pull(income_group) %>%
+  unique() %>%
+  length()
+income_pal <- wes_palette("BottleRocket2", n_income, type = "discrete")
+
+income_pal2 <- wes_palette("FantasticFox1", 5, type = "discrete")
+```
+
+## Visualise coverage timeseries for subset of countries
+This produces figure for the Supplementary Materials to provide exemplars of the forecasting outputs for the 5 largest countries with available data. 
+
+```{r, out.width = "100%", fig.width = 10, fig.height = 3}
+# Indentify largest countries in dataset
+unwpp_ordered <- unwpp_all %>%
+  filter(year == 2023) %>%
+  arrange(-surviving_infants) %>%
+  filter(iso_code %in% res_all$iso_code) %>% #filter to only those countries in final dataset
+  select(iso_code, surviving_infants) %>%
+  head(5)
+unwpp_ordered
+
+large_pops <- unwpp_ordered$iso_code
+
+# Identify improved countries in dataset
+improved <- res_all %>%
+  filter(within_ci == FALSE & coverage > mean)
+
+improved_countries <- improved$iso_code %>% unique()
+
+# Filter countries - can change to be 'improved_countries' or 'large_pops'
+x_plot <- x %>%
+  filter(iso_code %in% improved_countries)
+
+res_plot <- res_all %>%
+  filter(iso_code %in% improved_countries)
+
+# Generate plot
+arima_color <- "#ac3973"
+
+fig_forecasts <- ggplot(data = x_plot, aes(x = year, y = coverage)) +
+  theme_bw() +
+  geom_point(alpha = 0.8) +
+  geom_line(alpha = 0.3) +
+  geom_errorbar(data = res_plot, aes(x = year, ymin = lower_ci, ymax = upper_ci),
+                color = arima_color) +
+  geom_point(data = res_plot, aes(y = mean), shape = 3, color = arima_color) +
+  facet_wrap(~ country, nrow = 1, scales = "free_y",
+             labeller = label_wrap_gen(25)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1L), 
+                     limits = c(NA,1),
+                     n.breaks = 5) +
+  labs(y = "Coverage (%)",
+       x = "Year") +
+  theme(axis.text.x = element_text(angle=45,hjust = 1, size = 11),
+        axis.text.y = element_text(size = 11), 
+        strip.text.x = element_text(size = 11), 
+        axis.title = element_text(size = 14))
+fig_forecasts
+
+# Save file 
+ggsave(filename = here::here(fig_folder, paste("Supplementary_materials_Examples_",params$data,".png", sep = "")),
+       plot = fig_forecasts, 
+       width = 30, height = 10, units = "cm")
+
+```
+
+# DESCRIBE GLOBAL TRENDS
+
+## T-tests 
+### Unweighted coverage t-tests: i.e., each country equally weighted regardless of country size
+```{r}
+# Conduct t-test across each year
+ttests <- res_all %>%
+  split(res_all$year) %>%
+  lapply(function(e) t.test(x = e$delta,  
+                                alternative = "two.sided"))
+
+# Extract t-test results per year
+ttests <- lapply(names(ttests), function(year) {
+  test <- ttests[[year]]
+  data.frame(
+    year = year,
+    delta = test$estimate,
+    t.value = test$statistic,
+    p.value = test$p.value,
+    conf.low = test$conf.int[1],
+    conf.high = test$conf.int[2],
+    sample_size = test$parameter+1
+  )
+})
+
+ttests_tab <- do.call(rbind, ttests) %>%
+  mutate(year = as.numeric(year))
+
+# Include the reported and expected coverage
+cov_summary <- res_all %>%
+  split(res_all$year) %>%
+  lapply(function(e) {
+    data.frame(
+      year = unique(e$year),
+      reported = mean(e$coverage, na.rm = TRUE),
+      expected = mean(e$mean, na.rm = TRUE)
+    )
+  })
+
+cov_tab <- do.call(rbind, cov_summary)
+
+# Combine results
+ttests_summary <- ttests_tab %>%
+  left_join(cov_tab, by = "year") %>%
+  mutate(lower95 = reported - abs(conf.low),
+         upper95 = reported - abs(conf.high)) %>%
+  select(year, expected, reported, delta, lower95, upper95, 
+         conf.high, conf.low, p.value, sample_size)
+
+# Format output for paper
+tt_total_paper <- ttests_summary %>%
+  mutate(reported = round(reported, digits = 3) * 100,
+         Reported = paste(reported,"%", sep = ""),
+         expected = round(expected, digits = 3) * 100,
+         Expected = paste(expected,"%", sep = ""),
+         delta = round(delta, digits = 3) * 100,
+         lower_ci = round(conf.high, digits = 3) * 100,
+         upper_ci = round(conf.low, digits = 3) * 100,
+         Delta = paste(delta,"% [",lower_ci,"%; ",upper_ci,"%]",sep = ""),
+         `p-value` = ifelse(p.value < 0.0001, "< 0.0001", 
+                            signif(p.value, digits = 2))) %>%
+  select(Year = year, Expected, Reported, Delta, `p-value`)
+tt_total_paper
+
+write.csv(
+  tt_total_paper,
+  here::here(csv_folder, paste("table_paper_ttest_cov_unweighted_",params$data,".csv", sep = "")),
+  row.names = FALSE)
+
+# Create prettier Flextable for outputs
+tt_total_tab <- flextable(tt_total_paper) %>%
+  theme_vanilla() %>%
+  autofit()
+tt_total_tab
+
+doc <- read_docx()
+doc <- body_add_flextable(doc, value = tt_total_tab)
+print(doc, target = paste("../figures_cov/",params$data,"/tt_unweighted_tab_",
+                          params$data,".docx", sep =""))
+
+```
+
+### T-test on number of immunisations
+```{r}
+# Conduct t-test across each year
+ttests_num <- res_all %>%
+  split(res_all$year) %>%
+  lapply(function(e) t.test(x = e$delta_num,  
+                                alternative = "two.sided"))
+
+# Extract t-test results per year
+ttests_num <- lapply(names(ttests_num), function(year) {
+  test <- ttests_num[[year]]
+  data.frame(
+    year = year,
+    delta = test$estimate,
+    t.value = test$statistic,
+    p.value = test$p.value,
+    conf.low = test$conf.int[1],
+    conf.high = test$conf.int[2],
+    sample_size = test$parameter+1
+  )
+})
+
+ttests_num_tab <- do.call(rbind, ttests_num) %>%
+  mutate(year = as.numeric(year))
+
+# Include the reported and expected average number of immunisations
+num_summary <- res_all %>%
+  split(res_all$year) %>%
+  lapply(function(e) {
+    data.frame(
+      year = unique(e$year),
+      reported = mean(e$vaxxed, na.rm = TRUE),
+      expected = mean(e$expected_num, na.rm = TRUE)
+    )
+  })
+
+num_tab <- do.call(rbind, num_summary)
+
+# Combine results
+ttests_num_summary <- ttests_num_tab %>%
+  left_join(num_tab, by = "year") %>%
+  mutate(lower95 = reported - abs(conf.low),
+         upper95 = reported - abs(conf.high)) %>%
+  select(year, expected, reported, delta, lower95, upper95, 
+         conf.high, conf.low, p.value, sample_size)
+
+# Format output for paper
+tt_num_paper <- ttests_num_summary %>%
+  mutate(
+    Year = year,
+    Reported = comma(reported, digits = 0),
+    Expected = comma(expected, digits = 0),
+    delta = comma(delta, digits = 0),
+    lower_ci = comma(conf.high, digits = 0),
+    upper_ci = comma(conf.low, digits = 0),
+    Delta = paste(delta, " [", 
+                  lower_ci, " ; ", 
+                  upper_ci, "]", 
+                  sep = ""),
+    `p-value` = ifelse(p.value < 0.0001, "< 0.0001", signif(p.value, digits = 2))) %>%
+    select(Year, Expected, Reported, Delta, `p-value`)
+tt_num_paper
+
+write.csv(
+  tt_total_paper,
+  here::here(csv_folder, paste("table_paper_ttest_cov_num_",params$data,".csv", sep = "")),
+  row.names = FALSE)
+
+# Create prettier Flextable for outputs
+tt_num_tab <- flextable(tt_num_paper) %>%
+  theme_vanilla() %>%
+  autofit()
+tt_num_tab
+
+doc <- read_docx()
+doc <- body_add_flextable(doc, value = tt_num_tab)
+print(doc, target = paste("../figures_cov/",params$data,"/tt_num_tab_",
+                          params$data,".docx", sep =""))
+
+```
+
+## Visualise coverage trends globally
+
+### Unweighted global coverage
+- We produce a figure to show the trend in global vaccine coverage, unweighted for population size
+```{r}
+# Consolidate data
+unweighted <- timeseries_dat %>%
+  group_by(year) %>%
+  summarise(achieved = mean(coverage, na.rm = TRUE),
+            expected = mean(forecast_coverage, na.rm = TRUE)) %>%
+  mutate(expected = case_when(expected == "NaN" ~ achieved,
+                              .default = expected),
+         target = 0.99) %>%
+  pivot_longer(!year,
+               names_to = "category",
+               values_to = "percent") %>%
+  mutate(remove = case_when(year <= 2018 & category == "expected" ~ 1,
+                            .default = 0)) %>%
+  filter(remove != 1) %>%
+  select(-remove)
+
+# Plot graph showing global weighted coverage per year from 2000-2023
+global_cov_unweighted <- ggplot(data = unweighted, aes(x = year, y = percent)) +
+  geom_point(aes(colour = category), size = 2) +
+  geom_line(aes(colour = category), linewidth = 1, alpha = 0.5) +
+  geom_hline(yintercept = 0.99, linewidth = 1, alpha = 0.8, 
+             linetype = "dashed", colour = "red")+
+  scale_y_continuous(labels = scales::percent,
+                     n.breaks = 10, 
+                     limits = c(0.75,1)) +
+  scale_color_manual("", values = c(achieved = "#5884C3", 
+                                    expected = "darkblue", 
+                                    target = "red"), 
+                     labels = 
+                       c(paste("Reported",toupper(params$data)),
+                         paste("Modelled",toupper(params$data)),
+                         "Target coverage: 99%")) +
+  labs(y = "Mean coverage (%)",
+       x = "Year") +
+  theme_light() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
+    axis.text.y = element_text(size = 10),
+    strip.text.x = element_text(size = 10),
+    axis.title = element_text(size = 11, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    plot.title = element_text(size = 11, face = "bold", hjust = 0.5),
+    legend.position = c(0.7, 0.2),
+    legend.background = element_rect(colour = NA, fill = NA))
+global_cov_unweighted
+```
+
+### Number of immunisations
+```{r}
+# Weighted dataset
+weighted <- timeseries_dat %>%
+  group_by(year) %>%
+  summarise(reached = sum(reached_kids),
+            expected = sum(expected_kids),
+            si = sum(surviving_infants)) %>%
+  mutate(reached_perc = reached/si,
+         expected_perc = expected/si)
+
+# Restructure
+weighted_long <- weighted %>%
+  mutate(si_target = round(0.99*si)) %>%
+  select(year, reached, expected, si_target) %>%
+  pivot_longer(!year, names_to = "category", values_to = "number") %>%
+  mutate(remove = case_when(year <= 2018 & category == "expected" ~ 1,
+                            .default = 0)) %>%
+  filter(remove != 1) %>%
+  select(-remove)
+  
+global_num <- ggplot(data = weighted_long, aes(x = year, y = number)) +
+  geom_point(aes(colour = category), size = 2) +
+  geom_line(aes(colour = category), linewidth = 1, alpha = 0.5) +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-6),
+                     n.breaks = 10,
+                     limits = c(80000000,145000000)) +
+  scale_color_manual("", values = c(reached = "#5884C3", 
+                                    expected = "darkblue", 
+                                    si_target = "red"), 
+                     labels = 
+                       c(paste("Modelled",toupper(params$data)),
+                         paste("Reported",toupper(params$data)),
+                         "Target population: \n99% surviving infants")) +
+  labs(y = "Number of immunised children",
+       x = "Year") +
+  theme_light() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
+    axis.text.y = element_text(size = 10),
+    strip.text.x = element_text(size = 10),
+    axis.title = element_text(size = 11, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    plot.title = element_text(size = 11, face = "bold", hjust = 0.5),
+    legend.position = c(0.7, 0.2),
+    legend.background = element_rect(colour = NA, fill = NA))
+global_num
+```
+### Combine figures for comparability
+```{r}
+global <- plot_grid(global_cov_unweighted, global_num,
+                    ncol = 2,
+                    labels = c("2A", "2B"))
+
+global
+
+# Save file 
+ggsave(filename = here::here(fig_folder, 
+                             paste("Paper_global_immunisation_trends_",params$data,".png", 
+                                   sep = "")),
+       plot = global, 
+       width = 30, height = 10, units = "cm")
+
+```
+
+
+# DESCRIBE COUNTRY-LEVEL TRENDS
+
+## Plot difference between reported and expected coverage per country on scatterplots - single year
+- We create scatterplots for each year, such that each country is plot with its corresponding confidence interval. 
+- Red dots indicate countries for which the 95% CI of delta excludes zero.
+- These plots are combined together to produce Figure 2 of the paper [supplementary code to combine each plot not shown]
+```{r, fig.width = 8, fig.height = 8}
+# Enter which year to plot
+plot_year <- 2023
+
+res_plot <- res_all %>%
+  filter(year == plot_year,
+         !iso_code == "VEN") %>%
+  mutate(Colour = case_when(within_ci == TRUE ~ "within",
+                            .default = income_group)) %>%
+  mutate(Colour = factor(Colour, levels = c("within", "LIC", "LMIC", "UMIC", "HIC")))
+
+income_counts <- res_plot %>%
+  group_by(Colour) %>%
+  summarise(count = n())
+
+# Create scatterplot
+fig_overall_results <- res_plot %>% 
+  ggplot(aes(x = mean, y = coverage)) +
+  geom_pointrange(alpha = .6, aes(xmin = lower_ci, xmax = upper_ci, color = Colour)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) + 
+  scale_x_continuous(labels = unit_format(unit = "%", scale = 1e+2), limits = c(0.2,1)) +
+  scale_y_continuous(labels = unit_format(unit = "%", scale = 1e+2), limits = c(0.2,1)) +
+  scale_color_manual(values = c(`within` = "grey40",
+                                `LIC` = income_pal2[1],
+                                `LMIC` = income_pal2[2],
+                                `UMIC` = income_pal2[3],
+                                `HIC` = income_pal2[5]),
+                     labels = c(paste("Within Confidence Intervals (n = ",income_counts$count[1],")",sep = ""),
+                                paste("LIC (n = ",income_counts$count[2],")",sep = ""),
+                                paste("LMIC (n = ",income_counts$count[3],")",sep = ""),
+                                paste("UMIC (n = ",income_counts$count[4],")",sep = ""),
+                                paste("HIC (n = ",income_counts$count[5],")",sep = ""))) +
+  labs(x = paste("Expected coverage in",plot_year),
+       y = paste("Actual coverage in",plot_year), 
+       legend = "Colour") +
+  theme_light() +
+  theme(plot.title = element_text(face = "bold", size = 20),
+        legend.position = c(0.8,0.2),
+        axis.text = element_text(size = 12),
+        axis.title.y = element_text(angle = 90),
+        axis.title = element_text(size = 17)
+  )
+
+fig_overall_results
+
+# Save file
+ggsave(filename = here::here(fig_folder, paste("4fig_paper_partial_country_black_red_",params$data,"_",plot_year,".png", sep = "")),
+       plot = fig_overall_results, 
+       width = 17, height = 15, units = "cm")
+
+```
+## Classify country recovery status
+```{r}
+# Count number of countries where reported coverage is outside confidence intervals of expected coverage
+conf <- res_all %>% 
+  filter(!within_ci) %>%
+  mutate(classification = ifelse(coverage < lower_ci, "lower", "higher")) %>%
+  group_by(year, classification) %>%
+  count() %>%
+  pivot_wider(names_from = classification, values_from = n)
+conf
+
+# Classify country recovery status in 2023 
+explanatory_data <- res_all %>%
+  select(country, iso_code, year, expected = mean, lower_ci, upper_ci, reported = coverage, delta, lower_delta, upper_delta, within_ci, population, surviving_infants, expected_num, vaxxed, delta_num) %>%
+  mutate(class = case_when(within_ci == FALSE & reported <= expected ~ "decline",
+                           within_ci == TRUE ~ "within_ci",
+                           .default = "improve"),
+         classification = case_when(within_ci == FALSE & reported <= expected ~ 0,
+                                    within_ci == FALSE & reported >= expected ~ 2,
+                                    .default = 1))
+
+class_data <- explanatory_data %>% 
+  filter(year == 2023) %>%
+  select(iso_code, class) %>%
+  mutate(class = factor(class, levels = c("decline", "within_ci", "improve")))
+```
+
+## Describe missed children for countries outside of confidence intervals
+```{r}
+# Quantify expected vs. reported missed immunisations for countries outside confidence intervals
+res_ci <- res_all %>%
+  filter(within_ci == FALSE) %>%
+  group_by(year) %>%
+  summarise(expected = sum(expected_num),
+            reached = sum(vaxxed),
+            delta = abs(sum(delta_num)))
+res_ci
+
+# Create prettier Flextable for outputs
+res_ci_tab <- flextable(res_ci) %>%
+  theme_vanilla() %>%
+  autofit()
+
+doc <- read_docx()
+doc <- body_add_flextable(doc, value = res_ci_tab)
+print(doc, target = paste("../figures_cov/",params$data,"/res_ci_tab_",
+                          params$data,".docx", sep =""))
+
+```
+
+## Map country classification
+```{r}
+# Plot coverage deltas visually
+  # Download country map data
+  countries <- ne_countries(returnclass = "sf")
+
+  # Create dataset
+    map_data <- countries %>%
+      left_join(class_data, by = c("iso_a3" = "iso_code"))
+
+  # Palette for map
+    map_colours <- wes_palette(name = "BottleRocket2", type = "discrete", n = 3)
+    improved <- map_colours[3]
+    worse <- map_colours[2]
+    within_ci <- map_colours[1]
+ 
+     # Plot deltas
+    recovery_map <- ggplot(data = map_data) +
+      geom_sf(aes(fill = class), color = "black", size = 0.2) + 
+      scale_fill_manual(values = c(worse, within_ci, improved),
+                        na.value = "grey80",
+                        labels = c("Decline (n = 32/190, 16.8%)",
+                                   "Within confidence intervals (n = 81.6%)",
+                                   "Improved (n = 3/190, 1.6%)"))+ 
+      labs(fill = "Country classification") +
+      theme_minimal() +
+      theme(panel.background = element_rect(fill = "white"),
+            legend.position = c(0.15, 0.35),
+            legend.text = element_text(size = 9),
+            legend.title = element_text(size = 9, face = "bold"))
+
+    recovery_map
+    
+# Save figure
+ggsave(filename = here::here(fig_folder, paste("Paper_Geographic_recovery_",params$data,".png", sep = "")),
+       plot = recovery_map, 
+       width = 30, height = 15, units = "cm")
+```
+
+#EXPLANATORY ANALYSES
+
+## Import additional datasets
+We import datasets describing:
+- Pre-pandemic immunisation coverage for DTP3, as tracker of EPI performance
+- Number of doctors and nurses per capita, as indicator of health workforce capacity
+- Universal health coverage index, as indicator of health system strength
+- Excess mortality estimates from during COVID-19, as indicator of COVID-19 health disruption
+- Health financing data (per capita, and PPP), as indicator of financial investment in health systems
+- Gross Domestic Product data (per capita and PPP), as indicator of total country financial resources
+- COVID-19 vaccine mandate/policy stringency data, to explore if COVID-19 vaccine mandates may have impacted broader vaccine hesitancy
+- Global Health Security index score data, as indicator of broad health system preparedness for managing epidemics and pandemic responses
+- Pandemic policy data, spanning containment, economic, and health system policy response stringency during COVID-19 pandemic, as indicator of country responses to pandemic
+
+We also use the population size data from UNWPP (as imported above) to investigate if country size is related to residual coverage disruption
+```{r}
+# Import Pre-pandemic immunisation system strength
+file_path_RI <- here::here("data", "wuenic2023_dtp3.csv")
+
+ri_data <- file_path_RI %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+ri_data
+
+# Import RI schedules
+file_path_schedules <- here::here("data", "vaccine-schedule-data.csv")
+
+schedule_data <- file_path_schedules %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+schedule_data
+
+# Import Health workforce data
+file_path_doctors <- here::here("data", "doctors.csv")
+file_path_nurses <- here::here("data", "nurses.csv")
+
+doctors_data <- file_path_doctors %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+doctors_data
+
+nurses_data <- file_path_nurses %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+nurses_data
+
+# Import Universal Health Coverage data
+file_path_uhc <- here::here("data", "uhc_data.csv")
+
+uhc_data <- file_path_uhc %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+uhc_data
+
+# Import excess mortality data
+file_path_mortality_econ2 <- here::here("data", "excess-deaths-cumulative-per-100k-economist.csv")
+
+mortality_data_econ2 <- file_path_mortality_econ2 %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+mortality_data_econ2
+
+# Import health financing dataset
+file_path_hf_ppp <- here::here("data", "hf_ppp_2015_2022.csv")
+
+hf_ppp_data <- file_path_hf_ppp %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+hf_ppp_data
+
+# Import GDP data
+file_path_gdp <- here::here("data", "World_Bank_GDP_per_capita_PPP.csv")
+
+gdp_data <- file_path_gdp %>%
+  rio::import(header = TRUE, skip = 4) %>%
+  tibble()
+gdp_data
+
+# Import vaccine policy data
+file_path_vx_policy <- here::here("data", "OxCGRT_vaccines_full_national_v1.csv")
+
+vx_policy_data <- file_path_vx_policy  %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+vx_policy_data
+
+# Import Global Health Security preparedness data
+file_path_ghs <- here::here("data", "2021-GHS-Index-April-2022.csv")
+
+ghs_data <- file_path_ghs %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+ghs_data
+
+# Import pandemic policy data
+file_path_policy <- here::here("data", "OxCGRT_compact_national_v1.csv")
+
+policy_data <- file_path_policy %>%
+  rio::import(header = TRUE) %>%
+  tibble()
+policy_data
+
+```
+
+## Set-up exploratory dataset
+- Initiate tracker to keep all cleaned data per country together
+```{r}
+# Initiate tracker
+tracker <- explanatory_data %>%
+  select(iso_code) %>%
+  unique()
+```
+
+### Pre-pandemic immunisation system strength
+- Source: WUENIC coverage data, updated July 2024
+```{r}
+# Clean
+ri <- ri_data %>%
+  select(iso_code = iso3,
+         `2015`, `2016`, `2017`, `2018`, `2019`) %>%
+  rowwise() %>%
+  mutate(average_cov = mean(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+  select(iso_code, average_cov)
+
+# Add data to tracker
+tracker %<>%
+  left_join(ri, by = "iso_code")
+```
+
+### RI schedules
+- Source: WHO
+```{r}
+# Clean
+schedules <- schedule_data %>%
+  select(iso_code = ISO_3_CODE, vx = VACCINECODE, vx_desc = VACCINE_DESCRIPTION, target = TARGETPOP_DESCRIPTION, year = YEAR, geog = GEOAREA, age = AGEADMINISTERED, dose_num = SCHEDULEROUNDS)
+
+# Clean data to extract vaccines introduced in infant RI schedule per country
+ri_schedules <- schedules %>%
+  filter(geog == "NATIONAL", # Filter for RI schedules at national level to match WUENIC data
+         year == 2023,       # Filter for latest year of data
+         target == "General/routine", # Filter for included in routine schedules
+         dose_num == 1,      # Filter for first dose of course, to minimise number of duplications per vaccine type
+         !grepl("Y", age),   # Filter out schedules delivered to older children or adults. Y stands for Y and vaccines are coded in terms of B for birth, D for day number, M for month number and Y for year
+         !grepl("adult", vx_desc)) %>% # Filter for infant schedules i.e., not adult/special populations
+  unique() %>%
+  select(-c(geog, year, target))
+
+# Summarise number of vaccines in RI schedule per country
+count_schedule <- ri_schedules %>%
+  group_by(iso_code) %>%
+  count() %>%
+  select(iso_code, ri_intros = n)
+
+# Add data to tracker
+tracker %<>%
+  left_join(count_schedule, by = "iso_code")
+```
+
+### Health workforce
+- Source: WHO 
+```{r}
+# Filter and select data
+doctors <- doctors_data %>%
+  select(iso_code = SpatialDimValueCode, year = Period, value = Value) %>%
+  filter(year >= 2015 & year <= 2019) %>%
+  pivot_wider(names_from = year, values_from = value) %>%
+  rowwise() %>%
+  mutate(mean_doctors = mean(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+  select(iso_code, mean_doctors) %>%
+  as_tibble() 
+
+nurses <- nurses_data %>%
+  select(iso_code = SpatialDimValueCode, year = Period, value = Value) %>%
+  filter(year >= 2015 & year <= 2019) %>%
+  pivot_wider(names_from = year, values_from = value) %>%
+  rowwise() %>%
+  mutate(mean_nurses = mean(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+  select(iso_code, mean_nurses) %>%
+  as_tibble() 
+
+# Add to tracker
+tracker %<>%
+  left_join(doctors, by = "iso_code") %>%
+  left_join(nurses, by = "iso_code")
+
+```
+
+### Universal health coverage data
+- Source: WHO UHC indicator 3.8.1
+```{r}
+# Clean data
+uhc <- uhc_data %>%
+  filter(Period >= 2015 & Period <= 2022) %>%
+  select(iso_code = SpatialDimValueCode, uhc_index = FactValueNumeric, year = Period) %>%
+  pivot_wider(values_from = uhc_index, names_from = year, names_prefix = "uhc_index_") %>%
+  mutate(uhc_mean_index = round(rowMeans(select(.,uhc_index_2015, uhc_index_2017, uhc_index_2019), na.rm = TRUE), digits = 1)) %>%
+  select(iso_code, uhc_mean_index)
+
+# Add to tracker
+tracker %<>%
+  left_join(uhc, by = "iso_code")
+```
+
+### Global health security data
+- Source: Global Health Security Index
+```{r}
+# Clean data
+ghs <- ghs_data %>%
+  filter(Year == 2019) %>%
+        mutate(iso_code = countrycode(Country,
+                                      origin = "country.name",
+                                      destination = "iso3c")) %>%
+        select(c(iso_code, ghs_index = `OVERALL SCORE`)) 
+
+# Add to tracker
+tracker %<>%
+  left_join(ghs, by = "iso_code")
+```
+
+### Excess mortality data
+- Source: The Economist
+```{r}
+# clean data
+mort_dat_long <- mortality_data_econ2 %>%
+  mutate(Day = as.character(Day),
+         year = as.numeric(substr(Day, 1, 4))) %>%
+  filter(Day == "2020-12-28" | Day == "2021-12-27" | Day == "2022-12-26") %>% #Select year end data for each year only
+  select(iso_code = Code, year,
+         econ_mort_excess = `Cumulative excess deaths per 100,000 people (central estimate)`)
+
+# Add data to tracker
+tracker %<>%
+  left_join(mort_dat_long, by = "iso_code")
+
+
+```
+
+### Health financing
+- Source: WHO Global Health Expenditure Database (GHED)
+```{r}
+# Clean data
+hf_ppp <- hf_ppp_data %>%
+  mutate(iso_code = countrycode(Countries,
+                                origin = "country.name",
+                                destination = "iso3c")) %>%
+  select(iso_code, indicator = Indicators,  `2015`, `2016`, `2017`, `2018`, `2019`) %>% 
+  mutate(`2015` = as.numeric(gsub(",", "",`2015`)),
+         `2016` = as.numeric(gsub(",", "",`2016`)),
+         `2017` = as.numeric(gsub(",", "",`2017`)),
+         `2018` = as.numeric(gsub(",", "",`2018`)),
+         `2019` = as.numeric(gsub(",", "",`2019`))) %>%
+      rowwise() %>%
+      mutate(average = mean(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+      select(iso_code, indicator, average) %>%
+      pivot_wider(names_from = indicator,
+                  values_from = average) %>%
+      rename(che = `Current Health Expenditure (CHE)`,
+             gov = `Domestic General Government Health Expenditure (GGHE-D)`,
+             ext = `External Health Expenditure (EXT)`,
+             private = `Domestic Private Health Expenditure (PVT-D)`) %>%
+      mutate(che = round(as.numeric(gsub(",", "",che)), digits = 1),
+             gov = round(as.numeric(gsub(",", "",gov)), digits = 1),
+             ext = round(as.numeric(gsub(",", "",ext)), digits = 1),
+             private = round(as.numeric(gsub(",", "",private)), digits = 1),
+             ext = replace_na(ext, replace = 0)) 
+
+hf_summary <- hf_ppp %>%
+  select(iso_code, gov, ext, private)
+
+# Add to tracker
+tracker %<>%
+  left_join(hf_summary, by = "iso_code")
+```
+
+### Pandemic policies
+- Source: Oxford COVID-19 Government Response Tracker
+```{r}
+# Calculate and extract summary annual indicators
+policy <- policy_data %>%
+  filter(Jurisdiction == "NAT_TOTAL") %>% #Check that policies apply at national level
+  mutate(year = substr(Date, 1, 4),
+         month = substr(Date, 5, 6),
+         day = substr(Date, 7, 8),
+         date = dmy(paste(day, month, year, sep = "-"))) %>%
+  select(iso_code = CountryCode,
+         year,
+         c1m_school = `C1M_School closing`,
+         c2m_work = `C2M_Workplace closing`,
+         c3m_events = `C3M_Cancel public events`,
+         c4m_gatherings = `C4M_Restrictions on gatherings`,
+         c5m_public_transit = `C5M_Close public transport`,
+         c6m_stay_at_home = `C6M_Stay at home requirements`,
+         c7m_internal_mov = `C7M_Restrictions on internal movement`,
+         c8ev_international_travel = `C8EV_International travel controls`,
+         e1_income_support = `E1_Income support`,
+         e2_debt_relief = `E2_Debt/contract relief`,
+         e3_fiscal_measures = `E3_Fiscal measures`,
+         e4_international_support = `E4_International support`,
+         h1_public_info = `H1_Public information campaigns`,
+         h2_testing_policy = `H2_Testing policy`,
+         h3_contact_tracing = `H3_Contact tracing`,
+         h4_healthcare_invest = `H4_Emergency investment in healthcare`,
+         h5_vx_invest = `H5_Investment in vaccines`,
+         h6m_masks = `H6M_Facial Coverings`,
+         h7_vx_policy = `H7_Vaccination policy`,
+         h8m_elderly = `H8M_Protection of elderly people`) %>%
+  filter(year > 2019 & year < 2023) %>%
+  group_by(iso_code, year) %>%
+  summarise(across(everything(), mean)) %>% 
+  select(-c(e3_fiscal_measures,
+            e4_international_support,
+            h4_healthcare_invest,
+            h5_vx_invest)) %>% #Remove 4 variables since noted as incomplete/need caution
+  mutate(year = as.numeric(year))
+ 
+# Add data to tracker
+tracker %<>%
+  left_join(policy, by = c("iso_code", "year"))
+```
+
+### GDP
+- Source: World Bank
+```{r}
+# Clean data
+gdp <- gdp_data %>%
+  select(iso_code = `Country Code`,
+         `2015`, `2016`, `2017`, `2018`, `2019`) %>%
+  rowwise() %>%
+  mutate(average_gdp = mean(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+  select(iso_code, average_gdp)
+
+# Add data to tracker
+tracker %<>%
+  left_join(gdp, by = "iso_code")
+```
+
+### Vaccine mandate data
+- Source: Oxford COVID-19 Government Response Tracker
+```{r}
+# Clean data
+vx_policy <- vx_policy_data %>%
+  filter(Jurisdiction == "NAT_TOTAL") %>% #Check that policies apply at national level
+  rename(iso_code = CountryCode) %>%
+  mutate(year = substr(Date, 1, 4),
+         month = substr(Date, 5, 6),
+         day = substr(Date, 7, 8),
+         date = dmy(paste(day, month, year, sep = "-"))) %>%
+  group_by(iso_code, year) %>%
+  select(iso_code, year, starts_with("V4")) %>%
+  summarise(across(everything(), mean))
+
+# Summarise into single indicator
+vx_policy_highlevel <- vx_policy %>%
+  filter(year == 2022) %>% # Take 2022 stringency estimate since this has most data and most recent
+  select(iso_code, vx_stringency = `V4_Mandatory Vaccination (summary)`)
+
+# Add data to tracker
+tracker %<>%
+  left_join(vx_policy_highlevel, by = "iso_code")
+
+```
+
+### Country size
+- Source: UN WPP
+```{r}
+# Extract population data - and calculate mean coverage for 2020-2023 to factor in changes in population size within countries
+pop <- res_all %>%
+  select(iso_code, year, population) %>%
+  group_by(iso_code) %>%
+  summarise(average_pop = mean(population)) %>%
+  ungroup()
+
+# Add to tracker
+tracker %<>%
+  left_join(pop, by = "iso_code")
+```
+
+## Explore consolidated explanatory dataset
+- We explore and describe the explanatory dataset variables, including looking at variable distribution; missing values; and between variable correlation
+
+### Data completeness
+```{r}
+na_summary <- tracker %>%
+  summarise(across(everything(), ~ sum(is.na(.)), .names = "NA_count_{.col}")) %>%
+  pivot_longer(everything(), names_to = "Column", values_to = "NA_Count") %>%
+  mutate(Column = str_remove(Column, "NA_count_"))
+
+na_summary
+```
+- We are missing data for 75 countries for vaccine hesitancy. To keep the dataset larger for exploring relationships with other variables, we remove this variable for further analyses
+
+### Create final dataset for explanatory analyses
+```{r}
+tracker2 <- tracker %>%
+  select(-vx_stringency) %>%
+  mutate(year = as.numeric(year))
+
+tracker_2023 <- tracker2 %>%
+  group_by(iso_code) %>%
+  summarise(across(everything(), mean, na.rm = TRUE)) %>%
+  mutate(year = 2023)
+
+tracker_combo <- tracker2 %>%
+  rbind(tracker_2023)
+
+explore_data <- explanatory_data %>%
+  select(iso_code, year, classification) %>% #Extract response variable
+  mutate(classification = factor(classification, levels = c(0, 1, 2))) %>%
+  left_join(tracker_combo, by = c("iso_code", "year")) %>% # Add predictors
+  na.omit() #Remove incomplete line items
+explore_data
+```
+### Variable distribution
+```{r}
+# Restructure data for easier plotting
+  predictor_data <- explore_data %>%
+    select(-c(iso_code, year, classification))
+  
+# Reshape the data into a long format for ggplot2
+  long_predict_data <- predictor_data %>%
+    pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+# Create the facet plot of histograms
+  ggplot(long_predict_data, aes(x = value)) +
+    geom_histogram(bins = 30, fill = "blue", alpha = 0.7) + # Adjust bins if needed
+    facet_wrap(~variable, scales = "free") +
+    theme_minimal() +
+    labs(title = "Histograms of Predictor Variables",
+         x = "Value",
+         y = "Frequency")
+
+```
+
+### Check data normally distributed
+```{r}
+# Define inputs/set-up areas to store results
+  check_normality <- function(data, exclude_vars) {
+
+  predictors <- setdiff(names(data), exclude_vars)
+  
+  results <- list()
+  
+  # Loop through each predictor
+  for (predictor in predictors) {
+    class_0 <- shapiro.test(data[[predictor]][data$classification == 0])
+    class_1 <- shapiro.test(data[[predictor]][data$classification == 1])
+    
+    # Store the p-values
+    results[[predictor]] <- list(
+      class_0_p = round(class_0$p.value, digits = 3),
+      class_1_p = round(class_1$p.value, digits = 3))
+  }
+  
+  # Convert results to a data frame for easier reading
+  results_df <- do.call(rbind, lapply(results, as.data.frame))
+  rownames(results_df) <- predictors
+  return(results_df)
+}
+
+# Run the function on your dataset
+normality_results <- check_normality(
+  data = explore_data, 
+  exclude_vars = c("classification", "iso_code", "year")
+)
+
+# View the results
+print(normality_results)
+```
+### Between variable correlation
+```{r}
+corr_data <- cor(explore_data[-(1:3)])
+corrplot(corr_data)
+```
+
+
+### DAPC
+- We conduct Discriminant Analysis of Principal Components (DAPC), which is a two step method to first transform our data through Principal Component Analysis, and then conducts Discriminant Analysis on the retained principal components. This provides insight into linear combinations of our predictors that help explain the response variable. We use DAPC rather than Linear Discriminant Analysis since our predictors do not meet the requirements for LDA or normal distribution and no/minimal/comparable co-variance across classes.
+```{r}
+# Checks
+explore_data_binary <- explore_data %>%
+  filter(classification != 2) %>%
+  droplevels()
+
+predictor_data_binary <- explore_data_binary %>%
+  select(-c(iso_code, year, classification))
+
+# Run DAPC - three country classifications
+dapc1 <- dapc(predictor_data, grp = explore_data$classification,
+              scale = TRUE, var.loadings = TRUE, n.pca = 28, n.da = 2)
+
+summary(dapc1)
+scatter(dapc1, scree.pca = TRUE, posi.pca = "bottomright", posi.da = "none",
+        legend = TRUE, txt.leg = c("Below expected coverage", "Within confidence intervals"),
+        col = c(map_colours[2], map_colours[1], map_colours[3]))
+contrib <- loadingplot(dapc1$var.contr)
+
+# Comparison Run DAPC - exclude countries that improved since seem to be skewing the data
+dapc2 <- dapc(predictor_data_binary, grp = explore_data_binary$classification,
+              scale = TRUE, var.loadings = TRUE, n.pca = 28, n.da = 1)
+
+summary(dapc2)
+scatter(dapc2, scree.pca = TRUE, posi.pca = "bottomright", posi.da = "none",
+        legend = TRUE, txt.leg = c("Below expected coverage", "Within confidence intervals", "Above expected coverage"),
+        col = c(map_colours[2], map_colours[1]))
+contrib2 <- loadingplot(dapc2$var.contr)
+
+compoplot(dapc1)
+
+# Conduct cross validation
+xval1 <- xvalDapc(predictor_data, grp = explore_data$classification, n.pca.max = 28, 
+                  scale = TRUE, training.set = 0.5, n.da = 2, n.rep= 100,
+                  result = "groupMean")
+xval1
+
+# 
+xval2 <- xvalDapc(predictor_data_binary, grp = explore_data_binary$classification, n.pca.max = 100, 
+                  scale = TRUE, training.set = 0.5, n.da =1, n.rep= 100,
+                  result = "groupMean")
+xval2
+
+# Summarise findings from cross validation - NEED TO REWRITE
+xval1_check <- xval1$`Cross-Validation Results` %>% filter(n.pca == max(n.pca)) %>%
+  mutate(better = (success > xval1$`Median and Confidence Interval for Random Chance`[3]))
+
+xval1_count <- xval_check %>%
+  count(better)
+
+xval_count <- xval_check > xval1$`Median and Confidence Interval for Random Chance`[3]
+xval_count <- xval_check$success > xval1$`Median and Confidence Interval for Random Chance`[3]
+xval_count <- xval_check$success > xval2$`Median and Confidence Interval for Random Chance`[2]
+
+mean(xval_count)   # Report this in the write-up
+```
+
+## Random Forest
+### Conduct random forest
+```{r}
+# Set seed for reproducibility
+set.seed(42)
+
+# Split data into train and test data
+sample_size <- floor(0.7 * nrow(explore_data))
+train_indices <- sample(seq_len(nrow(explore_data)), size = sample_size)
+train_data <- explore_data[train_indices, ] 
+test_data <- explore_data[-train_indices, ] 
+
+# Remove descriptors for building random forest
+train_dat <- train_data %>%
+  select(-c("iso_code", "year"))
+
+test_dat <- test_data %>%
+  select(-c("iso_code", "year"))
+
+# Random Forest
+rf_model <- randomForest(classification ~ ., 
+                         type = "classification", 
+                         data = train_dat, 
+                         ntree = 500, 
+                         mtry = 5, 
+                         importance = TRUE, 
+                         rsq = TRUE)
+rf_model
+```
+We produce a figure to summarise the MDA and MDI scores per variable. 
+```{r}
+# Review MDA and MDI of variables from model
+importance(rf_model)
+varImpPlot(rf_model)
+
+# Output figure
+importance_data <- importance(rf_model) %>%
+  as.data.frame()
+
+importance_data %<>%
+  mutate(Variable = rownames(importance_data)) %>%
+  select(Variable, `Mean Decrease in Accuracy (%)` = `MeanDecreaseAccuracy`, 
+         `Mean Decrease in Impurity (%)` = `MeanDecreaseGini`) %>%
+  arrange(-`Mean Decrease in Accuracy (%)`) %>%
+  reshape2::melt(importance_df, id.vars = "Variable", 
+                          measure.vars = c("Mean Decrease in Accuracy (%)", 
+                                           "Mean Decrease in Impurity (%)"),
+                          variable.name = "Metric", 
+                          value.name = "Importance") 
+
+  # Create the plot
+  importance_plot <- ggplot(importance_data, 
+                            aes(x = reorder(Variable, Importance), 
+                                y = Importance, fill = Metric)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    geom_text(aes(label = paste0(round(Importance, 2), "%")),  # Format values as percentages
+              position = position_dodge(width = 0.9),  
+              hjust = ifelse(importance_data$Importance < 0.015, -1, 1), 
+              #nudge_y = ifelse(importance_data$Importance < 0, -1, 1),
+              size =2.5) + 
+    coord_flip() +  # Flip coordinates for better readability
+    facet_wrap(~ Metric, scales = "free_x") +  # Separate plots for MDA and MDI
+    labs(x = "Variables",
+         y = "Importance Scores") +
+    theme_minimal() +  
+    scale_fill_manual(values = wes_palette("BottleRocket2", n = 2)) +
+    theme(axis.title.x = element_text(size = 10, face = "bold"),
+          axis.title.y = element_text(size = 10, face = "bold"),
+          axis.text = element_text(size = 8),
+          plot.title = element_text(size = 12, face = "bold"),
+          legend.position = "none", 
+          strip.text = element_text(size = 8, face = "bold"),
+          panel.background = element_rect(fill = "white", colour = "white"),
+        plot.background = element_rect(fill = "white", colour = "white"))
+  importance_plot
+
+  # Save plot  
+  ggsave(importance_plot, 
+         filename = paste("../figures_cov/",params$data,"/rf_importance.png", sep =""),
+         height = 10, width = 25, units = "cm")
+  
+  # Write-up
+    # Some hints that uhc_mean_index helps classify 0-1 as well as 2
+    # overall pretty shit, need a lot of variables and still not hugely great
+    # need more variables? better data? other explanators?
+  
+  
+```
+
+### Evaluate the performance of the model
+We evaluate the overall predictive power of the model by evaluating the test dataset using the resulting Random Forest model
+```{r}
+# Predictive power
+  # Compare performance of using Random Forest model as predictor on test dataset
+  predictions <- predict(rf_model, newdata = test_dat)
+  
+  # Evaluate the model performance
+  actuals <- test_dat$classification
+  
+# Compare results
+  comparison <- test_data %>%
+    select(iso_code, classification) %>%
+    cbind(predictions) %>%
+    mutate(accuracy = case_when(predictions == classification ~ 1,
+                                .default = 0))
+  
+  rf_confusion_matrix <- confusionMatrix(comparison$predictions, comparison$classification)
+  rf_confusion_matrix
+```
+
+# SUPPLEMENTARY MATERIALS
+
+## Create summary output csv with all country-level data
+```{r}
+output_res <- res_all %>%
+  select(country, iso_code, region, income_group, year, arima_model = method,
+         forecast_coverage = mean, lower_ci, upper_ci, reported_coverage = coverage,
+         delta, lower_delta, upper_delta, within_ci, vaxxed) %>%
+  mutate(year = as.numeric(year))
+
+si_long <- unwpp_all %>%
+  select(iso_code, year, "surviving_infants") %>%
+  filter(year > 2019) 
+  
+output_res %<>%
+  left_join(si_long, by = c("iso_code", "year"))
+
+write.csv(
+  output_res,
+  here::here(csv_folder, paste("Supplementary_table_",params$data,".csv", sep = "")),
+  row.names = FALSE)
+```
